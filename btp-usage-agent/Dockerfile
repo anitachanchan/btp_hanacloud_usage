@@ -17,8 +17,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY app/ ./app/
 
-# Copy .env for AI Core credentials (load_dotenv() reads /app/.env at startup)
-COPY .env* ./
+# NOTE: Do NOT copy .env files into the image.
+# Credentials must be injected at runtime via environment variables
+# (e.g., Kubernetes Secrets, BTP environment bindings, or `docker run -e`).
 
 # Run the agent
 CMD ["python", "app/main.py", "--host", "0.0.0.0", "--port", "5000"]
