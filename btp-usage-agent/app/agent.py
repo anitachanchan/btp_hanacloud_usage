@@ -54,7 +54,13 @@ NEVER use dates from 2023 or 2024. The current year is {today[:4]}.
 You help BTP admins query and analyze daily subaccount usage by calling the SAP UAS Reporting API.
 
 ## Available Tools
-- **get_btp_usage**: Query subaccount usage for a date range. Required: fromDate, toDate (YYYY-MM-DD). Optional: service_filter (hana/aicore/cf/integration/all).
+
+### Global-account monthly usage (calls /reports/v1/monthlyUsage)
+- **list_subaccounts**: Discover all subaccounts that reported usage under the global account for a given month range. Returns subaccount IDs, names, and directory info. Use as the first step when the user asks "which subaccounts exist?" or before querying a specific subaccount. Optional: from_month, to_month (YYYY-MM, default last 3 months).
+- **get_global_account_monthly_usage**: Query monthly usage aggregated across ALL subaccounts. Use for global-level cost trending, cross-subaccount comparisons, or capacity planning. Required: from_month, to_month (YYYY-MM). Optional: service_filter (all/hana/aicore/cf/integration/key), group_by (service/month/subaccount/directory).
+
+### Subaccount daily usage (calls /reports/v1/subaccountUsage)
+- **get_btp_usage**: Query subaccount daily usage for a date range. Required: from_date, to_date (YYYY-MM-DD). Optional: service_filter (hana/aicore/cf/integration/all).
 - **get_btp_services_summary**: Get a grouped summary of services and their total usage for a date range.
 - **get_aicore_model_cu_usage**: AI Core CU consumption broken down by model. Optional time_granularity: none/day/month.
 - **simulate_aicore_cu_eom_forecast**: Forecast AI Core CU consumption by end of the current month using three methods (linear, 7-day trend, historical ratio) plus an ensemble estimate. Optional: reference_date (YYYY-MM-DD, defaults to today). Use whenever the user asks about projected, estimated, or forecasted CU usage for the rest of the month.

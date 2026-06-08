@@ -1,16 +1,22 @@
 """
-BTP UAS Reporting API Tool
-Calls GET /reports/v1/subaccountUsage directly with OAuth2 client credentials.
+BTP UAS Reporting API Tools
+Calls the SAP Usage Accounting Service (UAS) APIs using OAuth2 client credentials.
+
+Endpoints covered:
+  GET /reports/v1/subaccountUsage  — daily per-subaccount usage detail
+  GET /reports/v1/monthlyUsage     — monthly global-account usage report
 
 API reference:
-  https://api.sap.com/api/APIUasReportingService/path/dailySubaccountUsage
+  https://api.sap.com/api/APIUasReportingService
 
 Required environment variables (.env):
-  BTP_UAS_URL       = https://uas-reporting.cfapps.eu10.hana.ondemand.com
-  BTP_AUTH_URL      = https://<subdomain>.authentication.<region>.hana.ondemand.com/oauth/token
-  BTP_CLIENT_ID     = ...
-  BTP_CLIENT_SECRET = ...
-  BTP_SUBACCOUNT_ID = ...
+  BTP_UAS_URL           = https://uas-reporting.cfapps.eu10.hana.ondemand.com
+  BTP_AUTH_URL          = https://<subdomain>.authentication.<region>.hana.ondemand.com/oauth/token
+  BTP_CLIENT_ID         = ...
+  BTP_CLIENT_SECRET     = ...
+  BTP_SUBACCOUNT_ID     = ...   (for subaccountUsage tools)
+  BTP_GLOBAL_ACCOUNT_ID = ...   (reserved; not sent to monthlyUsage — scope is
+                                  implicit from the OAuth2 credentials)
 """
 
 import json
@@ -106,6 +112,75 @@ def _last_n_days(n: int) -> tuple[str, str]:
 
 def _yesterday() -> str:
     return (datetime.now(tz=timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+# ── Monthly date helpers (for /reports/v1/monthlyUsage) ──────────────────────
+
+def _current_ym() -> str:
+    """Return the current year-month as YYYY-MM (UTC)."""
+    return datetime.now(tz=timezone.utc).strftime("%Y-%m")
+
+
+def _ym_to_api(ym: str) -> str:
+    """Convert YYYY-MM → YYYYMM (the format the monthly usage API expects)."""
+    return ym.replace("-", "")
+
+
+def _validate_month(ym: str, field_name: str) -> str:
+    """Validate a YYYY-MM month string.
+
+    - Rejects anything that cannot be parsed as YYYY-MM → uses current month.
+    - Rejects months more than 2 years in the past (guards against LLM training-data
+      bias producing stale years) → uses current month.
+    - Clamps future months to the current month.
+    """
+    current = _current_ym()
+    try:
+        dt = datetime.strptime(ym, "%Y-%m")
+        current_year = datetime.now(tz=timezone.utc).year
+        if dt.year < current_year - 2:
+            logger.warning(
+                "Month validation: %s=%r is from %d — likely LLM bias. "
+                "Overriding with current month (%s).",
+                field_name, ym, dt.year, current,
+            )
+            return current
+        if ym > current:
+            logger.warning(
+                "Month validation: %s=%r is in the future. Clamping to %s.",
+                field_name, ym, current,
+            )
+            return current
+    except ValueError:
+        logger.warning(
+            "Month validation: %s=%r is not a valid YYYY-MM month. Using %s.",
+            field_name, ym, current,
+        )
+        return current
+    return ym
+
+
+def _last_n_months(n: int) -> tuple[str, str]:
+    """Return (from_month, to_month) covering the last *n* complete months."""
+    from calendar import monthrange
+
+    today = datetime.now(tz=timezone.utc)
+    # End of range: one month before today (last complete month)
+    if today.month == 1:
+        end_year, end_month = today.year - 1, 12
+    else:
+        end_year, end_month = today.year, today.month - 1
+
+    # Start of range: n-1 months before end
+    total_months = end_year * 12 + end_month - (n - 1)
+    start_year, start_month = divmod(total_months - 1, 12)
+    start_year += 1
+    start_month += 1
+
+    return (
+        f"{start_year:04d}-{start_month:02d}",
+        f"{end_year:04d}-{end_month:02d}",
+    )
 
 
 # ── Service classification ───────────────────────────────────────────────────
@@ -228,6 +303,57 @@ async def _fetch_usage_single(from_date: str, to_date: str) -> list[dict]:
         write=15.0,
         pool=15.0,
     )
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.get(
+            url,
+            params=params,
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    records = data.get("content", data) if isinstance(data, dict) else data
+    return records if isinstance(records, list) else []
+
+
+# ── Monthly usage API call (GET /reports/v1/monthlyUsage) ────────────────────
+
+async def _fetch_monthly_usage(from_month: str, to_month: str) -> list[dict]:
+    """
+    Call /reports/v1/monthlyUsage and return the list of records.
+
+    Args:
+        from_month: YYYY-MM (e.g. "2026-04")
+        to_month:   YYYY-MM (e.g. "2026-06")
+
+    Response record fields (SAP UAS monthly usage API):
+      globalAccountId, globalAccountName,
+      subaccountId, subaccountName,
+      directoryId, directoryName,
+      serviceId, serviceName,
+      plan, planName,
+      reportYearMonth,                ← integer YYYYMM, e.g. 202604
+      measureId, metricName, unitSingular, unitPlural,
+      usage,
+      categoryId, categoryName,
+      dataCenter, dataCenterName,
+      chargedBlockedStatus            ← "Charged" / "Blocked" etc.
+
+    Note: only fromDate/toDate (YYYYMM format) are accepted as query parameters.
+    There is no globalAccountId parameter — the global account scope is determined
+    implicitly by the OAuth2 client credentials (verified against the API spec).
+    """
+    uas_url = os.environ.get("BTP_UAS_URL", "https://uas-reporting.cfapps.eu10.hana.ondemand.com")
+    token   = await _get_token()
+
+    url    = f"{uas_url}/reports/v1/monthlyUsage"
+    params = {
+        "fromDate": _ym_to_api(from_month),   # YYYYMM format
+        "toDate":   _ym_to_api(to_month),      # YYYYMM format
+    }
+    logger.info("Monthly Usage GET %s  params=%s", url, params)
+
+    timeout = httpx.Timeout(connect=15.0, read=_HTTP_TIMEOUT_SECONDS, write=15.0, pool=15.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.get(
             url,
@@ -1268,4 +1394,386 @@ async def get_btp_services_summary(
         "service_count": len({r[0] for r in summary}),
         "group_summary": group_totals,
         "detail":        rows,
+    }, ensure_ascii=False)
+
+
+# ── Global-account monthly usage tools (GET /reports/v1/monthlyUsage) ─────────
+
+@tool
+async def list_subaccounts(
+    from_month: Optional[str] = None,
+    to_month: Optional[str] = None,
+) -> str:
+    """
+    Discover all subaccounts that reported usage under the BTP global account.
+
+    Calls /reports/v1/monthlyUsage and returns the distinct set of subaccount
+    IDs and names found within the requested period.  Use this tool as the
+    first step when you need to know which subaccounts exist BEFORE querying
+    a specific subaccount's daily detail with get_btp_usage.
+
+    Args:
+        from_month: Start month in YYYY-MM format (e.g. "2026-04").
+                    Defaults to 3 months ago.
+        to_month:   End month in YYYY-MM format (e.g. "2026-06").
+                    Defaults to last complete month.
+
+    Returns:
+        JSON with:
+          global_account_id   — global account GUID
+          global_account_name — display name
+          from_month / to_month
+          subaccount_count    — number of distinct subaccounts found
+          subaccounts         — sorted list of
+              { subaccount_id, subaccount_name,
+                directory_id, directory_name,
+                service_count, month_count }
+              where service_count = distinct services used,
+                    month_count  = distinct months with usage
+    """
+    # ── Resolve / default months ──────────────────────────────────────────────
+    default_from, default_to = _last_n_months(3)
+    from_month = _validate_month(from_month or default_from, "from_month")
+    to_month   = _validate_month(to_month   or default_to,   "to_month")
+    if from_month > to_month:
+        logger.warning("from_month %s > to_month %s — swapping.", from_month, to_month)
+        from_month, to_month = to_month, from_month
+
+    try:
+        records = await _fetch_monthly_usage(from_month, to_month)
+    except Exception as exc:
+        return json.dumps({"error": str(exc), "from_month": from_month, "to_month": to_month})
+
+    if not records:
+        return json.dumps({
+            "from_month": from_month,
+            "to_month":   to_month,
+            "message":    "No monthly usage records returned for the given period.",
+            "subaccount_count": 0,
+            "subaccounts":      [],
+        }, ensure_ascii=False)
+
+    # Extract global account info from the first record that has it
+    global_account_id   = ""
+    global_account_name = ""
+    for r in records:
+        if r.get("globalAccountId"):
+            global_account_id   = r["globalAccountId"]
+            global_account_name = r.get("globalAccountName", "")
+            break
+
+    # Aggregate per subaccount
+    sa_map: dict[str, dict] = {}
+    for r in records:
+        sa_id    = r.get("subaccountId")   or ""
+        sa_name  = r.get("subaccountName") or ""
+        dir_id   = r.get("directoryId")    or ""
+        dir_name = r.get("directoryName")  or ""
+
+        if not sa_id:
+            # Skip records that belong to the global account aggregate (no subaccountId)
+            continue
+
+        if sa_id not in sa_map:
+            sa_map[sa_id] = {
+                "subaccount_id":   sa_id,
+                "subaccount_name": sa_name,
+                "directory_id":    dir_id,
+                "directory_name":  dir_name,
+                "services":        set(),
+                "months":          set(),
+            }
+        # Update name in case earlier records had it blank
+        if sa_name and not sa_map[sa_id]["subaccount_name"]:
+            sa_map[sa_id]["subaccount_name"] = sa_name
+        if dir_id and not sa_map[sa_id]["directory_id"]:
+            sa_map[sa_id]["directory_id"]    = dir_id
+        if dir_name and not sa_map[sa_id]["directory_name"]:
+            sa_map[sa_id]["directory_name"]  = dir_name
+
+        service = r.get("serviceId") or r.get("serviceName") or ""
+        month   = str(r.get("reportYearMonth", ""))
+        if service:
+            sa_map[sa_id]["services"].add(service)
+        if month:
+            sa_map[sa_id]["months"].add(month)
+
+    # Serialise (sets → counts)
+    subaccounts = sorted(
+        [
+            {
+                "subaccount_id":   v["subaccount_id"],
+                "subaccount_name": v["subaccount_name"],
+                "directory_id":    v["directory_id"],
+                "directory_name":  v["directory_name"],
+                "service_count":   len(v["services"]),
+                "month_count":     len(v["months"]),
+            }
+            for v in sa_map.values()
+        ],
+        key=lambda x: x["subaccount_name"].lower() or x["subaccount_id"],
+    )
+
+    return json.dumps({
+        "global_account_id":   global_account_id,
+        "global_account_name": global_account_name,
+        "from_month":          from_month,
+        "to_month":            to_month,
+        "subaccount_count":    len(subaccounts),
+        "subaccounts":         subaccounts,
+    }, ensure_ascii=False)
+
+
+@tool
+async def get_global_account_monthly_usage(
+    from_month: str,
+    to_month: str,
+    service_filter: Optional[str] = "all",
+    group_by: Optional[str] = "service",
+) -> str:
+    """
+    Query the BTP global account monthly usage report (/reports/v1/monthlyUsage).
+
+    Returns usage data aggregated across ALL subaccounts under the global
+    account for one or more calendar months.  Use this tool for global-account-
+    level capacity planning, cost trending, or cross-subaccount comparisons.
+
+    For per-subaccount DAILY detail use get_btp_usage instead (after
+    discovering available subaccount IDs with list_subaccounts).
+
+    Args:
+        from_month:    Start month, YYYY-MM (e.g. "2026-04").
+        to_month:      End month, YYYY-MM (e.g. "2026-06").
+        service_filter: Filter results.  One of:
+            "all"         → all services (default)
+            "hana"        → SAP HANA Cloud only
+            "aicore"      → SAP AI Core only
+            "cf"          → Cloud Foundry Runtime only
+            "integration" → SAP Integration Suite only
+            "key"         → the 4 key services above combined
+        group_by:      Primary grouping dimension.  One of:
+            "service"     → aggregate by service + metric (default)
+            "month"       → aggregate by month, then service
+            "subaccount"  → aggregate by subaccount, then service
+            "directory"   → aggregate by directory (null → "root"), then service
+
+    Returns:
+        JSON with:
+          global_account_id / global_account_name
+          from_month / to_month / service_filter / group_by
+          total_records
+          monthly_totals        — [{month, total_usage_by_metric}] trend view
+          grouped_data          — main result shaped by group_by
+          raw_summary           — flat list sorted by total_usage desc
+    """
+    # ── Validate inputs ───────────────────────────────────────────────────────
+    from_month = _validate_month(from_month, "from_month")
+    to_month   = _validate_month(to_month,   "to_month")
+    if from_month > to_month:
+        logger.warning("from_month %s > to_month %s — swapping.", from_month, to_month)
+        from_month, to_month = to_month, from_month
+
+    filt = (service_filter or "all").lower()
+    grp  = (group_by or "service").lower()
+    if grp not in ("service", "month", "subaccount", "directory"):
+        logger.warning("Unknown group_by=%r — defaulting to 'service'.", grp)
+        grp = "service"
+
+    # ── Fetch ─────────────────────────────────────────────────────────────────
+    try:
+        records = await _fetch_monthly_usage(from_month, to_month)
+    except Exception as exc:
+        return json.dumps({"error": str(exc), "from_month": from_month, "to_month": to_month})
+
+    if not records:
+        return json.dumps({
+            "from_month": from_month,
+            "to_month":   to_month,
+            "message":    "No monthly usage records returned.",
+            "total_records": 0,
+            "monthly_totals": [],
+            "grouped_data":   [],
+            "raw_summary":    [],
+        }, ensure_ascii=False)
+
+    # Global account metadata from first populated record
+    global_account_id   = ""
+    global_account_name = ""
+    for r in records:
+        if r.get("globalAccountId"):
+            global_account_id   = r["globalAccountId"]
+            global_account_name = r.get("globalAccountName", "")
+            break
+
+    # ── Apply service filter ──────────────────────────────────────────────────
+    if filt == "key":
+        records = [r for r in records if _classify(r.get("serviceId", "")) != "other"]
+    elif filt != "all":
+        records = [r for r in records if _classify(r.get("serviceId", "")) == filt]
+
+    # ── Normalise records ─────────────────────────────────────────────────────
+    def _to_ym(raw_month) -> str:
+        """Convert API's YYYYMM integer/string → YYYY-MM display string."""
+        s = str(raw_month).strip()
+        if len(s) == 6 and s.isdigit():
+            return f"{s[:4]}-{s[4:]}"
+        return s or "unknown"
+
+    normalised = [
+        {
+            "service_id":      r.get("serviceId", ""),
+            "service_name":    r.get("serviceName") or r.get("serviceId", ""),
+            "plan":            r.get("planName") or r.get("plan", ""),
+            "metric_id":       r.get("measureId", ""),
+            "metric_name":     r.get("metricName") or r.get("measureId", ""),
+            "unit":            r.get("unitSingular") or r.get("unitPlural", ""),
+            "usage":           float(r.get("usage", 0)),
+            "month":           _to_ym(r.get("reportYearMonth", "")),
+            "subaccount_id":   r.get("subaccountId")   or "",
+            "subaccount_name": r.get("subaccountName") or "",
+            "directory_id":    r.get("directoryId")    or "",
+            "directory_name":  r.get("directoryName")  or "",
+            "category":        r.get("categoryName", ""),
+            "data_center":     r.get("dataCenter", ""),
+            "group":           _classify(r.get("serviceId", "")),
+        }
+        for r in records
+    ]
+
+    # ── Monthly trend (always computed) ──────────────────────────────────────
+    # month → metric_id → {unit, total}
+    month_metric_agg: dict[str, dict[str, dict]] = {}
+    for row in normalised:
+        m   = row["month"]
+        mid = row["metric_id"]
+        month_metric_agg.setdefault(m, {})
+        month_metric_agg[m].setdefault(mid, {"unit": row["unit"], "total": 0.0})
+        month_metric_agg[m][mid]["total"] = round(
+            month_metric_agg[m][mid]["total"] + row["usage"], 6
+        )
+
+    monthly_totals = sorted(
+        [
+            {
+                "month": m,
+                "metrics": sorted(
+                    [
+                        {"metric_id": mid, "unit": v["unit"], "total_usage": round(v["total"], 6)}
+                        for mid, v in metrics.items()
+                    ],
+                    key=lambda x: -x["total_usage"],
+                ),
+            }
+            for m, metrics in month_metric_agg.items()
+        ],
+        key=lambda x: x["month"],
+    )
+
+    # ── Flat summary: (service, plan, metric) → total ─────────────────────────
+    flat_key_fn = lambda row: (
+        row["service_name"], row["service_id"], row["plan"],
+        row["metric_name"], row["metric_id"], row["unit"], row["group"],
+    )
+    flat_agg: dict[tuple, float] = {}
+    for row in normalised:
+        k = flat_key_fn(row)
+        flat_agg[k] = round(flat_agg.get(k, 0.0) + row["usage"], 6)
+
+    raw_summary = sorted(
+        [
+            {
+                "service":     k[0],
+                "service_id":  k[1],
+                "plan":        k[2],
+                "metric":      k[3],
+                "metric_id":   k[4],
+                "unit":        k[5],
+                "group":       k[6],
+                "total_usage": v,
+            }
+            for k, v in flat_agg.items()
+        ],
+        key=lambda x: -x["total_usage"],
+    )
+
+    # ── Primary group_by dimension ─────────────────────────────────────────────
+    def _dim_key(row: dict) -> str:
+        if grp == "month":
+            return row["month"]
+        if grp == "subaccount":
+            return row["subaccount_id"] or "__global__"
+        if grp == "directory":
+            return row["directory_id"] or "__root__"
+        return row["service_id"]   # "service" (default)
+
+    def _dim_label(row: dict) -> str:
+        if grp == "month":
+            return row["month"]
+        if grp == "subaccount":
+            name = row["subaccount_name"]
+            return f"{name} ({row['subaccount_id']})" if name else row["subaccount_id"] or "(global)"
+        if grp == "directory":
+            name = row["directory_name"]
+            return f"{name} ({row['directory_id']})" if name else row["directory_id"] or "(root)"
+        return row["service_name"] or row["service_id"]   # "service"
+
+    # group_dim → secondary → metric_id → {unit, total}
+    group_agg: dict[str, dict[str, dict[str, dict]]] = {}
+    group_labels: dict[str, str] = {}
+    for row in normalised:
+        dim   = _dim_key(row)
+        label = _dim_label(row)
+        group_labels[dim] = label
+
+        sec = row["service_name"] or row["service_id"] if grp == "month" else row["month"]
+        mid = row["metric_id"]
+        group_agg.setdefault(dim, {})
+        group_agg[dim].setdefault(sec, {})
+        group_agg[dim][sec].setdefault(mid, {"unit": row["unit"], "total": 0.0})
+        group_agg[dim][sec][mid]["total"] = round(
+            group_agg[dim][sec][mid]["total"] + row["usage"], 6
+        )
+
+    def _sec_label() -> str:
+        return "month" if grp != "month" else "service"
+
+    grouped_data = sorted(
+        [
+            {
+                "dimension": dim,
+                "label":     group_labels[dim],
+                "breakdown": sorted(
+                    [
+                        {
+                            _sec_label(): sec,
+                            "metrics": sorted(
+                                [
+                                    {"metric_id": mid, "unit": v["unit"],
+                                     "total_usage": round(v["total"], 6)}
+                                    for mid, v in metrics.items()
+                                ],
+                                key=lambda x: -x["total_usage"],
+                            ),
+                        }
+                        for sec, metrics in sec_map.items()
+                    ],
+                    key=lambda x: x[_sec_label()],
+                ),
+            }
+            for dim, sec_map in group_agg.items()
+        ],
+        key=lambda x: x["dimension"],
+    )
+
+    return json.dumps({
+        "global_account_id":   global_account_id,
+        "global_account_name": global_account_name,
+        "from_month":          from_month,
+        "to_month":            to_month,
+        "service_filter":      filt,
+        "group_by":            grp,
+        "total_records":       len(normalised),
+        "monthly_totals":      monthly_totals,
+        "grouped_data":        grouped_data,
+        "raw_summary":         raw_summary,
     }, ensure_ascii=False)

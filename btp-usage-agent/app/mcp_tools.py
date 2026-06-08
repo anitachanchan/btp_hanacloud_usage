@@ -5,12 +5,20 @@ This agent does NOT use MCP / Agent Gateway.
 It directly calls the SAP UAS Reporting API using OAuth2 client credentials
 stored in the local .env file.
 
+Both endpoints (/reports/v1/subaccountUsage and /reports/v1/monthlyUsage) are
+part of the same UAS API and share the same base URL and OAuth2 credentials,
+so all tools live in a single module: uas_tool.py.
+
 To add more tools, import and add them to the list returned by get_mcp_tools().
 """
 
 import logging
 
 from uas_tool import (
+    # ── Global account monthly usage ─────────────────────────────────────────
+    list_subaccounts,
+    get_global_account_monthly_usage,
+    # ── Subaccount daily usage ────────────────────────────────────────────────
     get_btp_usage,
     get_btp_services_summary,
     get_aicore_model_cu_usage,
@@ -21,6 +29,12 @@ from uas_tool import (
 logger = logging.getLogger(__name__)
 
 _UAS_TOOLS = [
+    # ── Global account discovery & monthly reporting ──────────────────────────
+    # Call list_subaccounts first to discover available subaccount IDs,
+    # then pass a subaccount ID to get_btp_usage for daily detail.
+    list_subaccounts,
+    get_global_account_monthly_usage,
+    # ── Subaccount daily usage (UAS /reports/v1/subaccountUsage) ─────────────
     get_btp_usage,
     get_btp_services_summary,
     get_aicore_model_cu_usage,
